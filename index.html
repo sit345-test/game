@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>體感跟隨 - 極簡手臂版</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    
+    <style>
+        body {
+            background-color: black;
+            color: white;
+            font-family: 'Courier New', Courier, monospace;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            margin: 0;
+            overflow: hidden;
+        }
+
+        .container {
+            position: relative;
+            width: 640px;
+            height: 480px;
+            /* border: 1px solid #333; */
+        }
+
+        #input_video { display: none; }
+
+        /* 畫布：鏡像翻轉，讓操作直覺 */
+        #output_canvas {
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            transform: scaleX(-1); 
+        }
+
+        /* UI 層 (不翻轉) */
+        #ui-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            padding: 20px;
+            box-sizing: border-box;
+        }
+
+        .hud-top {
+            display: flex;
+            justify-content: space-between;
+            font-size: 24px;
+            font-weight: bold;
+            text-shadow: 2px 2px 4px #000;
+            z-index: 10;
+        }
+        #timer { color: #ffeb3b; }
+        #score { color: #00e676; }
+
+        /* 提示箭頭 */
+        #prompt-arrow {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 120px;
+            color: rgba(255, 255, 255, 0.1);
+            transition: all 0.2s ease-out;
+        }
+
+        .prompt-active {
+            color: #00ffff !important; /* 青色高亮 */
+            text-shadow: 0 0 30px #00ffff, 0 0 10px white;
+            transform: translate(-50%, -50%) scale(1.1) !important;
+        }
+
+        /* 狀態畫面 */
+        #screen-overlay {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0, 0, 0, 0.9);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 50;
+            transition: opacity 0.3s;
+        }
+        
+        .hidden { opacity: 0; pointer-events: none; }
+
+        h1 { margin-bottom: 10px; letter-spacing: 2px; }
+        p.sub-text { color: #aaa; font-size: 14px; margin-bottom: 30px; }
+        
+        button {
+            background: transparent;
+            border: 2px solid #00ffff;
+            color: #00ffff;
+            padding: 15px 40px;
+            font-size: 24px;
+            cursor: pointer;
+            font-family: inherit;
+            font-weight: bold;
+            transition: 0.2s;
+        }
+        button:hover { background: #00ffff; color: black; box-shadow: 0 0 20px #00ffff;}
+
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <video id="input_video"></video>
+        <canvas id="output_canvas" width="640" height="480"></canvas>
+        
+        <div id="ui-layer">
+            <div class="hud-top">
+                <div>TIME: <span id="time-display">60</span></div>
+                <div>SCORE: <span id="score-display">0</span></div>
+            </div>
+            <div id="prompt-arrow">⬆️</div>
+        </div>
+
+        <div id="screen-overlay">
+            <h1 id="overlay-title">系統載入中...</h1>
+            <p class="sub-text" id="overlay-sub">請允許攝影機權限並稍候</p>
+            <button id="start-btn" class="hidden" onclick="startGame()">開始遊戲 (60s)</button>
+        </div>
+    </div>
+
+    <script>
+        const videoElement = document.getElementById('input_video');
+        const canvasElement = document.getElementById('output_canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const timeDisplay = document.getElementById('time-display');
+        const scoreDisplay = document.getElementById('score-display');
+        const promptArrow = document.getElementById('prompt-arrow');
+        const screenOverlay = document.getElementById('screen-overlay');
+        const overlayTitle = document.getElementById('overlay-title');
+        const overlaySub = document.getElementById('overlay-sub');
+        const startBtn = document.getElementById('start-btn');
+
+        let score = 0;
+        let timeLeft = 60;
+        let gameTimer;
+        let isPlaying = false;
+        let currentPrompt = '';
+        let lastActionTime = 0;
+        let modelReady = false;
+
+        const ACTION_COOLDOWN = 500; // 動作冷卻時間(ms)
+
+        const ARROWS = { 'UP': '⬆️', 'DOWN': '⬇️', 'LEFT': '⬅️', 'RIGHT': '➡️' };
+        // 直接對應：題目是什麼，動作就是什麼
+        const REQUIRED_ACTION = {
+            'UP': 'POSE_UP', 'DOWN': 'POSE_DOWN', 
+            'LEFT': 'POSE_LEFT', 'RIGHT': 'POSE_RIGHT'
+        };
+
+        // MediaPipe Pose 設定
+        const pose = new Pose({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`});
+        pose.setOptions({
+            modelComplexity: 1,
+            smoothLandmarks: true,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+        pose.onResults(onResults);
+
+        const camera = new Camera(videoElement, {
+            onFrame: async () => { await pose.send({image: videoElement}); },
+            width: 640, height: 480
+        });
+        camera.start();
+
+        // --- 核心繪圖與偵測迴圈 ---
+        function onResults(results) {
+            if (!modelReady) {
+                modelReady = true;
+                overlayTitle.textContent = "體感跟隨挑戰";
+                overlaySub.textContent = "規則：跟著箭頭方向做動作";
+                startBtn.classList.remove('hidden');
+            }
+
+            // 1. 清空畫布 (全黑背景)
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            
+            if (results.poseLandmarks) {
+                // 2. 自定義繪圖：只畫手臂線條
+                drawSimpleArms(results.poseLandmarks);
+                
+                // 3. 動作偵測
+                if (isPlaying) {
+                    detectPose(results.poseLandmarks);
+                }
+            }
+            canvasCtx.restore();
+        }
+
+        // --- 自定義繪圖函數：只畫手臂 ---
+        function drawSimpleArms(landmarks) {
+            canvasCtx.lineWidth = 6; // 線條寬度
+            canvasCtx.strokeStyle = 'white'; // 線條顏色
+            canvasCtx.lineCap = 'round'; // 線條末端圓潤
+            canvasCtx.lineJoin = 'round';
+
+            // 取得關鍵點索引 (MediaPipe Pose Landmakrs)
+            // 左手臂: 肩(11) -> 肘(13) -> 腕(15)
+            // 右手臂: 肩(12) -> 肘(14) -> 腕(16)
+            const leftArmIndices = [11, 13, 15];
+            const rightArmIndices = [12, 14, 16];
+
+            drawArmPath(landmarks, leftArmIndices);
+            drawArmPath(landmarks, rightArmIndices);
+        }
+
+        // 繪製單一條手臂路徑的輔助函數
+        function drawArmPath(landmarks, indices) {
+            canvasCtx.beginPath();
+            let first Point = true;
+            for (const index of indices) {
+                const point = landmarks[index];
+                // 將標準化座標 (0.0-1.0) 轉換為畫布像素座標
+                const x = point.x * canvasElement.width;
+                const y = point.y * canvasElement.height;
+
+                if (firstPoint) {
+                    canvasCtx.moveTo(x, y);
+                    firstPoint = false;
+                } else {
+                    canvasCtx.lineTo(x, y);
+                }
+            }
+            canvasCtx.stroke();
+        }
+
+
+        // --- 動作判定邏輯 ---
+        function detectPose(landmarks) {
+            if (Date.now() - lastActionTime < ACTION_COOLDOWN) return;
+
+            const nose = landmarks[0];
+            const leftWrist = landmarks[15]; const rightWrist = landmarks[16];
+            const leftShoulder = landmarks[11]; const rightShoulder = landmarks[12];
+            const leftHip = landmarks[23]; const rightHip = landmarks[24];
+
+            // 計算身體中心 X 座標
+            const bodyCenterX = (leftShoulder.x + rightShoulder.x) / 2;
+            
+            let detectedAction = null;
+
+            // 判定邏輯 (與之前相同，但這次直接對應題目)
+            // UP: 手腕高於鼻子
+            if (leftWrist.y < nose.y && rightWrist.y < nose.y) detectedAction = 'POSE_UP';
+            // DOWN: 手腕低於臀部
+            else if (leftWrist.y > rightHip.y && rightWrist.y > leftHip.y) detectedAction = 'POSE_DOWN';
+            // LEFT/RIGHT: 身體中心偏左或偏右 (注意畫面已鏡像)
+            else if (bodyCenterX < 0.35) detectedAction = 'POSE_LEFT';
+            else if (bodyCenterX > 0.65) detectedAction = 'POSE_RIGHT';
+
+            if (detectedAction && detectedAction === REQUIRED_ACTION[currentPrompt]) {
+                // 答對
+                score++;
+                scoreDisplay.textContent = score;
+                lastActionTime = Date.now();
+                // 觸發答對視覺回饋
+                promptArrow.style.color = "#00e676"; // 變綠色一瞬間
+                setTimeout(() => nextPrompt(), 200); // 稍微延遲切換題目
+            }
+        }
+
+        // --- 遊戲流程控制 ---
+        function startGame() {
+            score = 0; timeLeft = 60;
+            scoreDisplay.textContent = score;
+            timeDisplay.textContent = timeLeft;
+            isPlaying = true;
+            screenOverlay.classList.add('hidden');
+            
+            clearInterval(gameTimer);
+            gameTimer = setInterval(() => {
+                timeLeft--;
+                timeDisplay.textContent = timeLeft;
+                if (timeLeft <= 0) endGame();
+            }, 1000);
+
+            nextPrompt();
+        }
+
+        function endGame() {
+            isPlaying = false;
+            clearInterval(gameTimer);
+            overlayTitle.textContent = "時間到!";
+            overlaySub.textContent = `最終得分: ${score}`;
+            startBtn.textContent = "再玩一次";
+            screenOverlay.classList.remove('hidden');
+            promptArrow.classList.remove('prompt-active');
+        }
+
+        function nextPrompt() {
+            const directions = ['UP', 'DOWN', 'LEFT', 'RIGHT'];
+            // 簡單防重複邏輯，提升體驗
+            let nextDir;
+            do {
+               nextDir = directions[Math.floor(Math.random() * directions.length)];
+            } while (nextDir === currentPrompt && directions.length > 1);
+            
+            currentPrompt = nextDir;
+            
+            // 重置樣式並激活新的提示
+            promptArrow.style.color = ""; // 重置顏色
+            void promptArrow.offsetWidth; // 強制重繪觸發 transition
+            promptArrow.textContent = ARROWS[nextDir];
+            promptArrow.classList.add('prompt-active');
+        }
+    </script>
+</body>
+</html>
