@@ -227,7 +227,7 @@
         // 繪製單一條手臂路徑的輔助函數
         function drawArmPath(landmarks, indices) {
             canvasCtx.beginPath();
-            let first Point = true;
+            let firstPoint = true;
             for (const index of indices) {
                 const point = landmarks[index];
                 // 將標準化座標 (0.0-1.0) 轉換為畫布像素座標
@@ -325,4 +325,5 @@
         }
     </script>
 </body>
+
 </html>
